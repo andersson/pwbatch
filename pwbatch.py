@@ -3,9 +3,12 @@
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import argparse
 import os
 import re
 import sys
+
+from functools import partial
 
 from pwclient import checks
 from pwclient import parser
@@ -26,11 +29,10 @@ def list_states(rpc):
     states = rpc.state_list("", 0)
     return [state['name'] for state in states]
 
-def list_new_patches(rpc, project_str):
+def pw_list_patches(rpc, project, state):
     filt = patches.Filter()
-#    filt.add('max_count', -1)
-    filt.add('project', project_str)
-    filt.add('state', 'New')
+    filt.add('project', project)
+    filt.add('state', state)
     filt.add('archived', False)
     filt.resolve_ids(rpc)
 
@@ -38,25 +40,24 @@ def list_new_patches(rpc, project_str):
     for p in ps:
         yield p
 
-
-def main(project='default'):
+def pwbatch(project_alias, current_state, state_func):
     # grab settings from config files
     config = utils.configparser.ConfigParser()
     config.read([CONFIG_FILE])
 
     try:
-        project_str = config.get('options', project)
+        project = config.get('options', project_alias)
     except (utils.configparser.NoSectionError,
             utils.configparser.NoOptionError):
         sys.stderr.write(
             'No default project configured in %s\n' % CONFIG_FILE)
         sys.exit(1)
 
-    url = config.get(project_str, 'url')
+    url = config.get(project, 'url')
 
     transport = xmlrpc.Transport(url)
-    transport.set_credentials(config.get(project_str, 'username'),
-                              config.get(project_str, 'password'))
+    transport.set_credentials(config.get(project, 'username'),
+                              config.get(project, 'password'))
 
     try:
         rpc = xmlrpc.xmlrpclib.Server(url, transport=transport)
@@ -65,14 +66,20 @@ def main(project='default'):
         sys.exit(1)
 
     all_states = list_states(rpc)
-    patches = list_new_patches(rpc, project_str)
+    patches = pw_list_patches(rpc, project, current_state)
 
     with open('/tmp/pwbatch', 'w') as f:
         for state in all_states:
             f.write('# %s\n' % state)
 
         for patch in patches:
-            f.write('[%s] %d %s\n' % (patch['state'], patch['id'], patch['name']))
+
+            if state_func:
+                state = state_func(rpc, patch)
+            else:
+                state = patch['state']
+
+            f.write('[%s] %d %s\n' % (state, patch['id'], patch['name']))
 
     err_line = None
 
@@ -109,7 +116,7 @@ def main(project='default'):
                 patch_id = int(m.group(2))
                 state_str = m.group(1)
 
-                if state_str == 'New':
+                if state_str == current_state:
                     continue
 
                 params = {}
@@ -137,9 +144,89 @@ def main(project='default'):
         if not success:
             sys.stderr.write("Patch %d not updated\n" % patch_id)
 
+def git_refspec_to_msgids(refspec):
+    with Popen(['git', 'rev-list', refspec], stdout=PIPE) as rev_list:
+        commits = [commit.decode('utf-8').strip() for commit in rev_list.stdout.readlines()]
+
+        for commit in commits:
+            with Popen(['git', 'cat-file', 'commit', commit], stdout=PIPE) as cat_file:
+                msg = cat_file.stdout.read().decode('utf-8')
+
+                m = re.search('Link: https://lore.kernel.org/r/(.+)', msg)
+                if not m:
+                    continue
+
+                msg_id = m.group(1)
+                yield msg_id
+
+def is_accepted(msgids, rpc, patch):
+        msgid = str(patch["msgid"]).strip("<>")
+
+        if msgid in msgids:
+            return 'Accepted'
+
+        return patch['state']
+
+def is_applicable(rpc, patch):
+    matches = [
+        'Documentation/devicetree/bindings/arm/msm/',
+        'Documentation/devicetree/bindings/arm/qcom.yaml',
+        'Documentation/devicetree/bindings/clock/qcom,',
+        'Documentation/devicetree/bindings/soc/qcom/',
+        'Documentation/devicetree/bindings/firmware/qcom',
+        'Documentation/devicetree/bindings/reserved-memory/qcom',
+        'MAINTAINERS',
+        'arch/arm/boot/dts/qcom-',
+        'arch/arm/configs/multi_v7_defconfig',
+        'arch/arm/configs/qcom_defconfig',
+        'arch/arm/mach-qcom/',
+        'arch/arm64/boot/dts/qcom/',
+        'arch/arm64/configs/defconfig',
+        'drivers/clk/qcom/',
+        'drivers/firmware/qcom_',
+        'drivers/soc/qcom/',
+        'include/dt-bindings/clock/qcom',
+        'include/linux/qcom_scm.h',
+        'include/linux/soc/qcom/',
+        'include/soc/qcom/',
+    ]
+
+    mbox = rpc.patch_get_mbox(patch['id'])
+    with Popen(['lsdiff', '--strip=1'], stdin=PIPE, stdout=PIPE) as lsdiff:
+        lsdiff.stdin.write(mbox.encode('utf-8'))
+        lsdiff.stdin.close()
+
+        files = [line.decode('utf-8').strip() for line in lsdiff.stdout.readlines()]
+        for file in files:
+            for match in matches:
+                if file.startswith(match):
+                    return patch['state']
+
+    return 'Not Applicable'
+
+def main():
+    parser = argparse.ArgumentParser(description='patchwork batch updater')
+    parser.add_argument('-p', '--project', default='default')
+    parser.add_argument('--mark-accepted', metavar='<refspec>')
+    parser.add_argument('--not-applicable', action='store_true')
+
+    args = parser.parse_args()
+
+    state_func = None
+    if args.mark_accepted:
+        current_state = 'Queued'
+        state_func = partial(is_accepted, list(git_refspec_to_msgids(args.mark_accepted)))
+    elif args.not_applicable:
+        current_state = 'New'
+        state_func = partial(is_applicable)
+    else:
+        current_state = 'New'
+
+    pwbatch(project_alias=args.project, current_state=current_state, state_func=state_func)
+
 if __name__ == "__main__":
     try:
-        main(*sys.argv[1:])
+        main()
     except (UnicodeEncodeError, UnicodeDecodeError):
         import traceback
         traceback.print_exc()
