@@ -79,7 +79,8 @@ def pwbatch(project_alias, current_state, state_func):
             else:
                 state = patch['state']
 
-            f.write('[%s] %d %s\n' % (state, patch['id'], patch['name']))
+            subject = patch['name'][:60].ljust(60)
+            f.write('[%s] %d %s %s\n' % (state, patch['id'], subject, patch['msgid']))
 
     err_line = None
 
