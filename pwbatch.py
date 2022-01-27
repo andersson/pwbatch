@@ -160,11 +160,11 @@ def git_refspec_to_msgids(refspec):
                 msg_id = m.group(1)
                 yield msg_id
 
-def is_accepted(msgids, rpc, patch):
+def is_accepted(msgids, new_state, rpc, patch):
         msgid = str(patch["msgid"]).strip("<>")
 
         if msgid in msgids:
-            return 'Accepted'
+            return new_state
 
         return patch['state']
 
@@ -209,14 +209,17 @@ def main():
     parser = argparse.ArgumentParser(description='patchwork batch updater')
     parser.add_argument('-p', '--project', default='default')
     parser.add_argument('--mark-accepted', metavar='<refspec>')
+    parser.add_argument('--mark-queued', metavar='<refspec>')
     parser.add_argument('--not-applicable', action='store_true')
-
     args = parser.parse_args()
 
     state_func = None
     if args.mark_accepted:
         current_state = 'Queued'
-        state_func = partial(is_accepted, list(git_refspec_to_msgids(args.mark_accepted)))
+        state_func = partial(is_accepted, list(git_refspec_to_msgids(args.mark_accepted)), 'Accepted')
+    elif args.mark_queued:
+        current_state = 'New'
+        state_func = partial(is_accepted, list(git_refspec_to_msgids(args.mark_queued)), 'Queued')
     elif args.not_applicable:
         current_state = 'New'
         state_func = partial(is_applicable)
