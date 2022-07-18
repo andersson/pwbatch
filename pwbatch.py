@@ -10,13 +10,8 @@ import sys
 
 from functools import partial
 
-from pwclient import checks
-from pwclient import parser
-from pwclient import patches
-from pwclient import projects
-from pwclient import states
+from pwclient import api as pw_api
 from pwclient import utils
-from pwclient import xmlrpc
 
 import pprint
 pprint = pprint.PrettyPrinter().pprint
@@ -24,23 +19,33 @@ pprint = pprint.PrettyPrinter().pprint
 from subprocess import Popen, PIPE
 
 CONFIG_FILE = os.path.expanduser('~/.pwclientrc')
+TMP_FILE = '/tmp/pwbatch'
 
-def list_states(rpc):
-    states = rpc.state_list("", 0)
+def list_states(api):
+    states = api.state_list("", 0)
     return [state['name'] for state in states]
 
-def pw_list_patches(rpc, project, state):
-    filt = patches.Filter()
-    filt.add('project', project)
-    filt.add('state', state)
-    filt.add('archived', False)
-    filt.resolve_ids(rpc)
+def pw_list_patches(api, project, state):
+    filters = {
+        'project': project,
+        'state': state,
+        'archived': False,
+        'msgid': None,
+        'name': None,
+        'max_count': None,
+        'submitter': None,
+        'delegate': None,
+    }
 
-    ps = rpc.patch_list(filt.d)
+    ps = api.patch_list(**filters)
     for p in ps:
+        # patch_list currently ignores filters['archives'] when it's False
+        if p['archived']:
+            print(p['archived'])
+            continue
         yield p
 
-def pwbatch(project_alias, current_state, state_func):
+def pwbatch(tmp_file, project_alias, current_state, state_func):
     # grab settings from config files
     config = utils.configparser.ConfigParser()
     config.read([CONFIG_FILE])
@@ -55,27 +60,27 @@ def pwbatch(project_alias, current_state, state_func):
 
     url = config.get(project, 'url')
 
-    transport = xmlrpc.Transport(url)
-    transport.set_credentials(config.get(project, 'username'),
-                              config.get(project, 'password'))
+    kwargs = {}
+    kwargs['username'] = config.get(project, 'username')
+    kwargs['password'] = config.get(project, 'password')
 
     try:
-        rpc = xmlrpc.xmlrpclib.Server(url, transport=transport)
-    except (IOError, OSError):
-        sys.stderr.write("Unable to connect to %s\n" % url)
+        api = pw_api.XMLRPC(url, **kwargs)
+    except exceptions.APIError as exc:
+        sys.stderr.write(str(exc))
         sys.exit(1)
 
-    all_states = list_states(rpc)
-    patches = pw_list_patches(rpc, project, current_state)
+    all_states = list_states(api)
+    patches = pw_list_patches(api, project, current_state)
 
-    with open('/tmp/pwbatch', 'w') as f:
+    with open(tmp_file, 'w') as f:
         for state in all_states:
             f.write('# %s\n' % state)
 
         for patch in patches:
 
             if state_func:
-                state = state_func(rpc, patch)
+                state = state_func(api, patch)
             else:
                 state = patch['state']
 
@@ -87,7 +92,7 @@ def pwbatch(project_alias, current_state, state_func):
     while True:
         updates = []
 
-        cmd = ['vim', '/tmp/pwbatch']
+        cmd = ['vim', tmp_file]
         if err_line:
             cmd.append('+%d' % err_line)
 
@@ -99,7 +104,7 @@ def pwbatch(project_alias, current_state, state_func):
         err_line = None
         current_line = 0
 
-        with open('/tmp/pwbatch', 'r') as f:
+        with open(tmp_file, 'r') as f:
             lines = f.readlines()
 
             for line in lines:
@@ -121,7 +126,7 @@ def pwbatch(project_alias, current_state, state_func):
                     continue
 
                 params = {}
-                params['state'] = states.state_id_by_name(rpc, m.group(1))
+                params['state'] = m.group(1)
 
                 if params['state'] == 0:
                     err_line = current_line
@@ -138,9 +143,9 @@ def pwbatch(project_alias, current_state, state_func):
 
         success = False
         try:
-            success = rpc.patch_set(patch_id, params)
-        except xmlrpclib.Fault as f:
-            sys.stderr.write("Error updating patch %d: %s\n" % (patch_id, f.faultString))
+            success = api.patch_set(patch_id, state=params['state'])
+        except Exception as f:
+            sys.stderr.write("Error updating patch %d: %s\n" % (patch_id, str(f)))
 
         if not success:
             sys.stderr.write("Patch %d not updated\n" % patch_id)
@@ -160,7 +165,7 @@ def git_refspec_to_msgids(refspec):
                 msg_id = m.group(1)
                 yield msg_id
 
-def is_accepted(msgids, new_state, rpc, patch):
+def is_accepted(msgids, new_state, api, patch):
         msgid = str(patch["msgid"]).strip("<>")
 
         if msgid in msgids:
@@ -168,31 +173,16 @@ def is_accepted(msgids, new_state, rpc, patch):
 
         return patch['state']
 
-def is_applicable(rpc, patch):
-    matches = [
-        'Documentation/devicetree/bindings/arm/msm/',
-        'Documentation/devicetree/bindings/arm/qcom.yaml',
-        'Documentation/devicetree/bindings/clock/qcom,',
-        'Documentation/devicetree/bindings/soc/qcom/',
-        'Documentation/devicetree/bindings/firmware/qcom',
-        'Documentation/devicetree/bindings/reserved-memory/qcom',
-        'MAINTAINERS',
-        'arch/arm/boot/dts/qcom-',
-        'arch/arm/configs/multi_v7_defconfig',
-        'arch/arm/configs/qcom_defconfig',
-        'arch/arm/mach-qcom/',
-        'arch/arm64/boot/dts/qcom/',
-        'arch/arm64/configs/defconfig',
-        'drivers/clk/qcom/',
-        'drivers/firmware/qcom_',
-        'drivers/soc/qcom/',
-        'include/dt-bindings/clock/qcom',
-        'include/linux/qcom_scm.h',
-        'include/linux/soc/qcom/',
-        'include/soc/qcom/',
-    ]
+def is_applicable(api, patch):
+    matches = []
+    with open('.pwbatch-applicable', 'r') as f:
+        matches = [line.strip() for line in f.readlines()]
 
-    mbox = rpc.patch_get_mbox(patch['id'])
+    if len(matches) == 0:
+        print('.pwbatch-applicable is empty')
+        sys.exit(1)
+
+    mbox, filename = api.patch_get_mbox(patch['id'])
     with Popen(['lsdiff', '--strip=1'], stdin=PIPE, stdout=PIPE) as lsdiff:
         lsdiff.stdin.write(mbox.encode('utf-8'))
         lsdiff.stdin.close()
@@ -213,6 +203,8 @@ def main():
     parser.add_argument('--not-applicable', action='store_true')
     args = parser.parse_args()
 
+    tmp_file = '/tmp/pwbatch-%s' % args.project
+
     state_func = None
     if args.mark_accepted:
         current_state = 'Queued'
@@ -226,7 +218,7 @@ def main():
     else:
         current_state = 'New'
 
-    pwbatch(project_alias=args.project, current_state=current_state, state_func=state_func)
+    pwbatch(tmp_file, project_alias=args.project, current_state=current_state, state_func=state_func)
 
 if __name__ == "__main__":
     try:
