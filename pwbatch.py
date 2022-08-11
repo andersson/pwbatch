@@ -41,7 +41,6 @@ def pw_list_patches(api, project, state):
     for p in ps:
         # patch_list currently ignores filters['archives'] when it's False
         if p['archived']:
-            print(p['archived'])
             continue
         yield p
 
