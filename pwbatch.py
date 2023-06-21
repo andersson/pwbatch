@@ -35,6 +35,7 @@ def pw_list_patches(api, project, state):
         'max_count': None,
         'submitter': None,
         'delegate': None,
+        'hash': None
     }
 
     ps = api.patch_list(**filters)
